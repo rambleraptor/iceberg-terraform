@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -33,13 +32,18 @@ func TestProvider(t *testing.T) {
 
 // newOAuth2CatalogServer returns a fake REST catalog that issues a token from
 // tokenPath and rejects catalog requests that don't carry exactly that token
-// and the wantHeaders.
+// and the wantHeaders. Token requests must not carry an Authorization header.
 func newOAuth2CatalogServer(t *testing.T, tokenPath string, wantForm, wantHeaders map[string]string) *httptest.Server {
 	t.Helper()
 
 	const token = "issued-token"
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+tokenPath, func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Values("Authorization"); len(auth) > 0 {
+			http.Error(w, fmt.Sprintf("token request carries Authorization %q", auth), http.StatusBadRequest)
+
+			return
+		}
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 
@@ -168,7 +172,7 @@ func TestOAuth2WithHeaders(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				// The OAuth2 token must replace, not duplicate, a configured
-				// Authorization header.
+				// Authorization header, which must not reach the token endpoint.
 				Config: fmt.Sprintf(`
 provider "iceberg" {
   catalog_uri = %q
@@ -191,55 +195,4 @@ data "iceberg_namespace" "ns" {
 			},
 		},
 	})
-}
-
-func TestOAuth2Validation(t *testing.T) {
-	cases := map[string]struct {
-		auth    string
-		wantErr string
-	}{
-		"conflicts with token": {
-			auth: `token = "static"
-  auth = { oauth2 = { credential = "client:secret" } }`,
-			wantErr: `(?s)Invalid Attribute Combination`,
-		},
-		"conflicts with sigv4": {
-			auth: `auth = {
-    oauth2 = { credential = "client:secret" }
-    sigv4  = { region = "us-east-1" }
-  }`,
-			wantErr: `(?s)Invalid Attribute Combination`,
-		},
-		"relative server_uri": {
-			auth:    `auth = { oauth2 = { credential = "client:secret", server_uri = "/oauth/tokens" } }`,
-			wantErr: `Invalid OAuth2 Server URI`,
-		},
-		"missing credential": {
-			auth:    `auth = { oauth2 = { scope = "catalog" } }`,
-			wantErr: `(?s)attribute\s+"credential" is required`,
-		},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			resource.UnitTest(t, resource.TestCase{
-				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-				Steps: []resource.TestStep{
-					{
-						Config: fmt.Sprintf(`
-provider "iceberg" {
-  catalog_uri = "http://localhost:1"
-  %s
-}
-
-data "iceberg_namespace" "ns" {
-  name = ["ns"]
-}
-`, tc.auth),
-						ExpectError: regexp.MustCompile(tc.wantErr),
-					},
-				},
-			})
-		})
-	}
 }

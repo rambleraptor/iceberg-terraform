@@ -57,17 +57,32 @@ func object(typ tftypes.Object, set map[string]tftypes.Value) tftypes.Value {
 	return tftypes.NewValue(typ, vals)
 }
 
-// authProviderConfig builds a provider configuration with catalog_uri and the given auth value.
-func authProviderConfig(t *testing.T, auth tftypes.Value) *tfprotov6.DynamicValue {
+// providerConfigWith builds a provider configuration with catalog_uri and the given attributes set.
+func providerConfigWith(t *testing.T, set map[string]tftypes.Value) *tfprotov6.DynamicValue {
 	t.Helper()
 	configType, _, _ := schemaTypes(t)
-	config, err := tfprotov6.NewDynamicValue(configType, object(configType, map[string]tftypes.Value{
-		"catalog_uri": str("http://localhost:8181"),
-		"auth":        auth,
-	}))
+	vals := map[string]tftypes.Value{"catalog_uri": str("http://localhost:8181")}
+	maps.Copy(vals, set)
+	config, err := tfprotov6.NewDynamicValue(configType, object(configType, vals))
 	require.NoError(t, err)
 
 	return &config
+}
+
+// authProviderConfig builds a provider configuration with catalog_uri and the given auth value.
+func authProviderConfig(t *testing.T, auth tftypes.Value) *tfprotov6.DynamicValue {
+	t.Helper()
+
+	return providerConfigWith(t, map[string]tftypes.Value{"auth": auth})
+}
+
+// oauth2ObjectType returns the Terraform type of auth.oauth2.
+func oauth2ObjectType(t *testing.T, auth tftypes.Object) tftypes.Object {
+	t.Helper()
+	oauth2, ok := auth.AttributeTypes["oauth2"].(tftypes.Object)
+	require.True(t, ok)
+
+	return oauth2
 }
 
 // sigv4ProviderConfig builds a provider configuration that sets the given auth.sigv4 attributes.
@@ -176,9 +191,10 @@ func TestValidateSigV4RequiresCompleteKeyPair(t *testing.T) {
 	}
 }
 
-func TestNewCatalogRefusesSigV4SettingsUnknownAtPlan(t *testing.T) {
+func TestNewCatalogRefusesAuthUnknownAtPlan(t *testing.T) {
 	isolateAWSEnv(t)
 	_, authType, sigv4Type := schemaTypes(t)
+	oauth2Type := oauth2ObjectType(t, authType)
 	unknown := tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
 	withSigV4 := func(set map[string]tftypes.Value) tftypes.Value {
 		return object(authType, map[string]tftypes.Value{"sigv4": object(sigv4Type, set)})
@@ -190,6 +206,12 @@ func TestNewCatalogRefusesSigV4SettingsUnknownAtPlan(t *testing.T) {
 		"signing name": withSigV4(map[string]tftypes.Value{"region": str("us-east-1"), "signing_name": unknown}),
 		"sigv4":        object(authType, map[string]tftypes.Value{"sigv4": tftypes.NewValue(sigv4Type, tftypes.UnknownValue)}),
 		"auth":         tftypes.NewValue(authType, tftypes.UnknownValue),
+		"oauth2 credential": object(authType, map[string]tftypes.Value{
+			"oauth2": object(oauth2Type, map[string]tftypes.Value{"credential": unknown}),
+		}),
+		"oauth2 server uri": object(authType, map[string]tftypes.Value{
+			"oauth2": object(oauth2Type, map[string]tftypes.Value{"credential": str("client:secret"), "server_uri": unknown}),
+		}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := &icebergProvider{}
@@ -203,7 +225,58 @@ func TestNewCatalogRefusesSigV4SettingsUnknownAtPlan(t *testing.T) {
 			headers, err := configHeaders(t, p)
 			require.ErrorContains(t, err, "not known until apply")
 
-			assert.Nil(t, headers, "nothing may be sent until auth.sigv4 is known")
+			assert.Nil(t, headers, "nothing may be sent until auth is known")
+		})
+	}
+}
+
+func TestValidateOAuth2Settings(t *testing.T) {
+	_, authType, sigv4Type := schemaTypes(t)
+	oauth2Type := oauth2ObjectType(t, authType)
+	withOAuth2 := func(set map[string]tftypes.Value) tftypes.Value {
+		return object(authType, map[string]tftypes.Value{"oauth2": object(oauth2Type, set)})
+	}
+	credential := map[string]tftypes.Value{"credential": str("client:secret")}
+
+	for name, tc := range map[string]struct {
+		config map[string]tftypes.Value
+		want   string
+	}{
+		"credential only": {map[string]tftypes.Value{"auth": withOAuth2(credential)}, ""},
+		"conflicts with token": {map[string]tftypes.Value{
+			"token": str("static"),
+			"auth":  withOAuth2(credential),
+		}, "Invalid Attribute Combination"},
+		"conflicts with sigv4": {map[string]tftypes.Value{"auth": object(authType, map[string]tftypes.Value{
+			"oauth2": object(oauth2Type, credential),
+			"sigv4":  object(sigv4Type, map[string]tftypes.Value{"region": str("us-east-1")}),
+		})}, "Invalid Attribute Combination"},
+		"empty credential": {map[string]tftypes.Value{
+			"auth": withOAuth2(map[string]tftypes.Value{"credential": str("")}),
+		}, "auth.oauth2.credential string length must be at least 1"},
+		"relative server_uri": {map[string]tftypes.Value{
+			"auth": withOAuth2(map[string]tftypes.Value{"credential": str("client:secret"), "server_uri": str("/oauth/tokens")}),
+		}, "Invalid OAuth2 Server URI"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server, err := providerserver.NewProtocol6WithError(New()())()
+			require.NoError(t, err)
+			config := providerConfigWith(t, tc.config)
+
+			validateResp, err := server.ValidateProviderConfig(context.Background(),
+				&tfprotov6.ValidateProviderConfigRequest{Config: config})
+			require.NoError(t, err)
+			configureResp, err := server.ConfigureProvider(context.Background(),
+				&tfprotov6.ConfigureProviderRequest{Config: config})
+			require.NoError(t, err)
+
+			errs := append(errorDiagnostics(validateResp.Diagnostics), errorDiagnostics(configureResp.Diagnostics)...)
+			if tc.want == "" {
+				assert.Empty(t, errs)
+
+				return
+			}
+			assert.Contains(t, strings.Join(errs, "\n"), tc.want)
 		})
 	}
 }

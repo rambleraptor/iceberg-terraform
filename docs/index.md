@@ -75,7 +75,7 @@ provider "iceberg" {
 ### Optional
 
 - `auth` (Attributes) Authentication settings for the Iceberg REST catalog. (see [below for nested schema](#nestedatt--auth))
-- `headers` (Map of String, Sensitive) The headers to use for authentication.
+- `headers` (Map of String, Sensitive) The headers to use for authentication. With `auth.oauth2`, an `Authorization` entry is not sent, and the other headers are also sent to the OAuth2 token endpoint.
 - `token` (String, Sensitive) The token to use for authentication.
 - `type` (String) The type of catalog. Use 'rest' for a plain REST catalog.
 - `warehouse` (String) The warehouse to use for the Iceberg REST catalog. This will be passed as `warehouse` property in the catalog properties.

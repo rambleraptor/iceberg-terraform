@@ -61,6 +61,8 @@ type icebergProvider struct {
 	headers     map[string]string
 	sigv4       *sigv4Config
 	oauth2      *oauth2Config
+	// authUnknown is set while planning when auth depends on values known only after apply.
+	authUnknown bool
 }
 
 // oauth2Config holds the OAuth2 client credentials settings passed to iceberg-go.
@@ -79,8 +81,6 @@ type sigv4Config struct {
 	accessKeyID     string
 	secretAccessKey string
 	sessionToken    string
-	// unknown is set while planning when auth depends on values known only after apply.
-	unknown bool
 }
 
 // icebergProviderModel maps provider schema data to a Go type.
@@ -142,7 +142,7 @@ func (p *icebergProvider) Schema(_ context.Context, _ provider.SchemaRequest, re
 				Optional:    true,
 			},
 			"headers": schema.MapAttribute{
-				Description: "The headers to use for authentication.",
+				Description: "The headers to use for authentication. With `auth.oauth2`, an `Authorization` entry is not sent, and the other headers are also sent to the OAuth2 token endpoint.",
 				Optional:    true,
 				Sensitive:   true,
 				ElementType: types.StringType,
@@ -203,6 +203,9 @@ func (p *icebergProvider) Schema(_ context.Context, _ provider.SchemaRequest, re
 								Description: "The client credential, formatted as `client_id:client_secret`. A value without a colon is used as the client secret with an empty client ID.",
 								Required:    true,
 								Sensitive:   true,
+								Validators: []validator.String{
+									stringvalidator.LengthAtLeast(1),
+								},
 							},
 							"server_uri": schema.StringAttribute{
 								Description: "The OAuth2 token endpoint. Defaults to `{catalog_uri}/v1/oauth/tokens`.",
@@ -297,6 +300,7 @@ func (p *icebergProvider) Configure(ctx context.Context, req provider.ConfigureR
 
 	p.sigv4 = nil
 	p.oauth2 = nil
+	p.authUnknown = false
 	if !data.Auth.IsNull() {
 		authValue, err := data.Auth.ToTerraformValue(ctx)
 		if err != nil {
@@ -306,8 +310,8 @@ func (p *icebergProvider) Configure(ctx context.Context, req provider.ConfigureR
 		}
 
 		if !authValue.IsFullyKnown() {
-			// Guessing any part would sign with the wrong scope or identity.
-			p.sigv4 = &sigv4Config{unknown: true}
+			// Guessing any part would authenticate with the wrong scope or identity.
+			p.authUnknown = true
 		} else {
 			var auth icebergAuthModel
 			resp.Diagnostics.Append(data.Auth.As(ctx, &auth, basetypes.ObjectAsOptions{})...)
@@ -376,6 +380,10 @@ func configureOAuth2(ctx context.Context, obj types.Object, resp *provider.Confi
 }
 
 func (p *icebergProvider) NewCatalog(ctx context.Context) (catalog.Catalog, error) {
+	if p.authUnknown {
+		return nil, errors.New("auth is not known until apply, so requests cannot be authenticated yet")
+	}
+
 	opts := make([]rest.Option, 0)
 	if p.token != "" && p.sigv4 == nil {
 		opts = append(opts, rest.WithOAuthToken(p.token))
@@ -402,8 +410,12 @@ func (p *icebergProvider) NewCatalog(ctx context.Context) (catalog.Catalog, erro
 	}
 
 	if p.sigv4 == nil {
-		if len(p.headers) > 0 {
-			opts = append(opts, rest.WithHeaders(p.headers))
+		headers := p.headers
+		if p.oauth2 != nil {
+			headers = withoutAuthorization(headers)
+		}
+		if len(headers) > 0 {
+			opts = append(opts, rest.WithHeaders(headers))
 		}
 		// Without a transport, iceberg-go builds one per catalog and never
 		// closes its idle connections.
@@ -417,6 +429,19 @@ func (p *icebergProvider) NewCatalog(ctx context.Context) (catalog.Catalog, erro
 	}
 
 	return rest.NewCatalog(ctx, p.catalogType, p.catalogURI, opts...)
+}
+
+// withoutAuthorization drops the Authorization header, which the OAuth2 token
+// replaces and which must not reach a separate token endpoint.
+func withoutAuthorization(headers map[string]string) map[string]string {
+	kept := make(map[string]string, len(headers))
+	for name, value := range headers {
+		if http.CanonicalHeaderKey(name) != "Authorization" {
+			kept[name] = value
+		}
+	}
+
+	return kept
 }
 
 // options returns the iceberg-go options that sign requests with SigV4.
@@ -455,9 +480,6 @@ func (s *sigv4Config) options(ctx context.Context, token string, headers map[str
 // replace the AWS credential chain. The region falls back to the AWS
 // environment, and credential providers that call STS get it as well.
 func (s *sigv4Config) awsConfig(ctx context.Context) (aws.Config, error) {
-	if s.unknown {
-		return aws.Config{}, errors.New("auth is not known until apply, so requests cannot be authenticated yet")
-	}
 	static := s.accessKeyID != "" && s.secretAccessKey != ""
 	if !static && (s.accessKeyID != "" || s.secretAccessKey != "" || s.sessionToken != "") {
 		// Never fall back to the AWS credential chain when keys were configured.
