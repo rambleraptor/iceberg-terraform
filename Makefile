@@ -13,22 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: test-integration test-integration-setup test-integration-exec test-integration-cleanup
+.PHONY: test-integration test-integration-serve
 
-test-integration: ## Start Docker services, run integration tests, then tear down
-	@$(MAKE) test-integration-setup
-	@EXIT=0; $(MAKE) test-integration-exec || EXIT=$$?; $(MAKE) test-integration-cleanup; exit $$EXIT
+test-integration: ## Start an Iceberg REST catalog, run integration tests, then stop it
+	dev/test-integration.sh
 
-test-integration-setup: ## Start Docker services for integration tests
-	docker compose -f dev/docker-compose.yml kill
-	docker compose -f dev/docker-compose.yml rm -f
-	docker compose -f dev/docker-compose.yml up -d --wait
-
-test-integration-exec: ## Run integration tests (Iceberg REST at 8181)
-	TF_ACC=1 ICEBERG_CATALOG_URI=http://localhost:8181 go test ./... -v
-
-test-integration-cleanup: ## Clean up integration test environment
-	@if [ "${KEEP_COMPOSE}" != "1" ]; then \
-		echo "Cleaning up Docker containers..."; \
-		docker compose -f dev/docker-compose.yml down; \
-	fi
+test-integration-serve: ## Run an Iceberg REST catalog at localhost:8181 until Ctrl-C
+	dev/test-integration.sh serve
