@@ -70,4 +70,5 @@ jobs:
     - name: Run tests
       run: go test -v ./...
     - name: Run integration tests
-      run: go run ./dev/testcatalog run -- go test -v ./...
+      shell: bash
+      run: dev/test-integration.sh

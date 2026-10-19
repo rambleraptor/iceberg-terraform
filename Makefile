@@ -16,7 +16,7 @@
 .PHONY: test-integration test-integration-serve
 
 test-integration: ## Start an Iceberg REST catalog, run integration tests, then stop it
-	go run ./dev/testcatalog run -- go test ./... -v
+	dev/test-integration.sh
 
 test-integration-serve: ## Run an Iceberg REST catalog at localhost:8181 until Ctrl-C
-	go run ./dev/testcatalog serve
+	dev/test-integration.sh serve
